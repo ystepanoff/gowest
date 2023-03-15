@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/ystepanoff/gowest"
 	"net/http"
 )
 
@@ -11,6 +12,18 @@ func main() {
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.Header)
-	fmt.Println(w, "Hello, World!")
+	fmt.Println("connection attempt")
+	conn, bufrw, err := gowest.GetConnection(w, r)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer conn.Close()
+	for {
+		msg, ok := gowest.Read(*bufrw)
+		if !ok {
+			break
+		}
+		fmt.Println(string(msg))
+	}
 }
