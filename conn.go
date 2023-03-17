@@ -6,10 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 )
 
 var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
@@ -21,14 +21,23 @@ func wsSecKey(key []byte) string {
 	return base64.StdEncoding.EncodeToString(sha.Sum(nil))
 }
 
+func tokenPresentInString(s string, t string) bool {
+	tokens := strings.Fields(s)
+	for _, token := range tokens {
+		if t == token {
+			return true
+		}
+	}
+	return false
+}
+
 func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
-	if r.Header.Get("Upgrade") != "websocket" {
+	if !tokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
 		return nil, nil, errors.New("Unidentified upgrade protocol")
 	}
-	fmt.Println(r.Header.Get("Connection"))
-	//if r.Header.Get("Connection") != "Upgrade" {
-	//	return nil, nil, errors.New("Connection: Upgrade header expected")
-	//}
+	if !tokenPresentInString(r.Header.Get("Connection"), "Upgrade") {
+		return nil, nil, errors.New("Connection: Upgrade header expected")
+	}
 	key := []byte(r.Header.Get("Sec-Websocket-Key"))
 	if key == nil {
 		return nil, nil, errors.New("Sec-Websocoket-Key expected")
@@ -42,12 +51,20 @@ func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Rea
 	if err != nil {
 		return nil, nil, err
 	}
-
-	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	bufrw.WriteString("Upgrade: websocket\r\n")
-	bufrw.WriteString("Connection: Upgrade\r\n")
-	bufrw.WriteString("Sec-Websocket-Accept: " + acceptStr + "\r\n\r\n")
-	bufrw.Flush()
+	resp := []string{
+		"HTTP/1.1 101 Switching Protocols\r\n",
+		"Upgrade: websocket\r\n",
+		"Connection: Upgrade\r\n",
+		"Sec-Websocket-Accept: " + acceptStr + "\r\n\r\n",
+	}
+	for _, h := range resp {
+		if _, err := bufrw.WriteString(h); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := bufrw.Flush(); err != nil {
+		return nil, nil, err
+	}
 
 	return conn, bufrw, nil
 }
