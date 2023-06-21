@@ -12,8 +12,6 @@ import (
 	"strings"
 )
 
-var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-
 func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
 	if !tokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
 		return nil, nil, errors.New("Unidentified upgrade protocol")
@@ -175,7 +173,7 @@ func wsWriteFrame(bufrw bufio.ReadWriter, frame wsFrame) error {
 func wsSecKey(key []byte) string {
 	sha := sha1.New()
 	sha.Write(key)
-	sha.Write(wsGUID)
+	sha.Write([]byte(wsGUID))
 	return base64.StdEncoding.EncodeToString(sha.Sum(nil))
 }
 
