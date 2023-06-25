@@ -2,14 +2,11 @@ package gowest
 
 import (
 	"bufio"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 )
 
 func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
@@ -38,8 +35,8 @@ func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Rea
 		"Connection: Upgrade\r\n",
 		"Sec-Websocket-Accept: " + acceptStr + "\r\n\r\n",
 	}
-	for _, h := range resp {
-		if _, err := bufrw.WriteString(h); err != nil {
+	for _, s := range resp {
+		if _, err := bufrw.WriteString(s); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -50,7 +47,7 @@ func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Rea
 	return conn, bufrw, nil
 }
 
-func Read(bufrw bufio.ReadWriter) ([]byte, error) {
+func Read(bufrw *bufio.ReadWriter) ([]byte, error) {
 	var message []byte
 	for {
 		frame, err := wsReadFrame(bufrw)
@@ -65,7 +62,7 @@ func Read(bufrw bufio.ReadWriter) ([]byte, error) {
 	return message, nil
 }
 
-func WriteString(bufrw bufio.ReadWriter, message []byte) error {
+func WriteString(bufrw *bufio.ReadWriter, message []byte) error {
 	frame := wsFrame{
 		uint64(len(message)),
 		1,
@@ -85,7 +82,7 @@ type wsFrame struct {
 	payload []byte
 }
 
-func wsReadFrame(bufrw bufio.ReadWriter) (*wsFrame, error) {
+func wsReadFrame(bufrw *bufio.ReadWriter) (*wsFrame, error) {
 	header := make([]byte, 2, 12)
 	if _, err := bufrw.Read(header); err != nil {
 		return nil, err
@@ -141,7 +138,7 @@ func wsReadFrame(bufrw bufio.ReadWriter) (*wsFrame, error) {
 	return frame, nil
 }
 
-func wsWriteFrame(bufrw bufio.ReadWriter, frame wsFrame) error {
+func wsWriteFrame(bufrw *bufio.ReadWriter, frame wsFrame) error {
 	buf := make([]byte, 2)
 	buf[0] |= frame.opCode
 	if frame.isFinal {
@@ -168,21 +165,4 @@ func wsWriteFrame(bufrw bufio.ReadWriter, frame wsFrame) error {
 		return err
 	}
 	return nil
-}
-
-func wsSecKey(key []byte) string {
-	sha := sha1.New()
-	sha.Write(key)
-	sha.Write([]byte(wsGUID))
-	return base64.StdEncoding.EncodeToString(sha.Sum(nil))
-}
-
-func tokenPresentInString(s string, t string) bool {
-	tokens := strings.Fields(s)
-	for _, token := range tokens {
-		if t == token {
-			return true
-		}
-	}
-	return false
 }

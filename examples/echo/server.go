@@ -20,13 +20,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 	for {
-		msg, err := gowest.Read(*bufrw)
+		msg, err := gowest.Read(bufrw)
 		if err != nil {
 			fmt.Println(err)
 			break
 		}
 		fmt.Println(string(msg))
-		if err := gowest.WriteString(*bufrw, msg); err != nil {
+		if err := gowest.WriteString(bufrw, msg); err != nil {
 			fmt.Println(err)
 		}
 	}
