@@ -1,5 +1,7 @@
 GoWest is a minimalistic [WebSocket](https://datatracker.ietf.org/doc/html/rfc6455) protocol implementation in Go.
 
+![GoWest](GoWest.png)
+
 ## Installation
 ```
 go install github.com/ystepanoff/gowest@latest
