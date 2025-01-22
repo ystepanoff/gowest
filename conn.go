@@ -9,12 +9,15 @@ import (
 	"net/http"
 )
 
-func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
+func GetConnection(
+	w http.ResponseWriter,
+	r *http.Request,
+) (net.Conn, *bufio.ReadWriter, error) {
 	if !tokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
-		return nil, nil, errors.New("Unidentified upgrade protocol")
+		return nil, nil, errors.New("cnidentified upgrade protocol")
 	}
 	if !tokenPresentInString(r.Header.Get("Connection"), "Upgrade") {
-		return nil, nil, errors.New("Connection: Upgrade header expected")
+		return nil, nil, errors.New("connection: Upgrade header expected")
 	}
 	key := []byte(r.Header.Get("Sec-Websocket-Key"))
 	if key == nil {
@@ -23,7 +26,7 @@ func GetConnection(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Rea
 	acceptStr := wsSecKey(key)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		return nil, nil, errors.New("Unable to hijack HTTP connection")
+		return nil, nil, errors.New("unable to hijack HTTP connection")
 	}
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
