@@ -1,4 +1,4 @@
-package gowest
+package utils
 
 import (
 	"crypto/sha1"
@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-func tokenPresentInString(s string, t string) bool {
+func TokenPresentInString(s string, t string) bool {
 	tokens := strings.Fields(s)
 	for _, token := range tokens {
 		if t == token {
@@ -16,7 +16,7 @@ func tokenPresentInString(s string, t string) bool {
 	return false
 }
 
-func wsSecKey(key []byte) string {
+func WSSecKey(key []byte) string {
 	sha := sha1.New()
 	sha.Write(key)
 	sha.Write([]byte(wsGUID))

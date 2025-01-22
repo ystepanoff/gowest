@@ -7,23 +7,25 @@ import (
 	"io"
 	"net"
 	"net/http"
+
+	"github.com/ystepanoff/gowest/internal/utils"
 )
 
 func GetConnection(
 	w http.ResponseWriter,
 	r *http.Request,
 ) (net.Conn, *bufio.ReadWriter, error) {
-	if !tokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
-		return nil, nil, errors.New("cnidentified upgrade protocol")
+	if !utils.TokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
+		return nil, nil, errors.New("unidentified upgrade protocol")
 	}
-	if !tokenPresentInString(r.Header.Get("Connection"), "Upgrade") {
+	if !utils.TokenPresentInString(r.Header.Get("Connection"), "Upgrade") {
 		return nil, nil, errors.New("connection: Upgrade header expected")
 	}
 	key := []byte(r.Header.Get("Sec-Websocket-Key"))
 	if key == nil {
 		return nil, nil, errors.New("Sec-Websocoket-Key expected")
 	}
-	acceptStr := wsSecKey(key)
+	acceptStr := utils.WSSecKey(key)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return nil, nil, errors.New("unable to hijack HTTP connection")
@@ -98,9 +100,10 @@ func wsReadFrame(bufrw *bufio.ReadWriter) (*wsFrame, error) {
 		extra += 4
 	}
 	size := uint64(header[1] & 0x7f)
-	if size == 126 {
+	switch size {
+	case 126:
 		extra += 2
-	} else if size == 127 {
+	case 127:
 		extra += 8
 	}
 	if extra > 0 {
@@ -108,10 +111,11 @@ func wsReadFrame(bufrw *bufio.ReadWriter) (*wsFrame, error) {
 		if _, err := bufrw.Read(header); err != nil {
 			return nil, err
 		}
-		if size == 126 {
+		switch size {
+		case 126:
 			size = uint64(binary.BigEndian.Uint16(header[:2]))
 			header = header[2:]
-		} else if size == 127 {
+		case 127:
 			size = binary.BigEndian.Uint64(header[:8])
 			header = header[8:]
 		}
