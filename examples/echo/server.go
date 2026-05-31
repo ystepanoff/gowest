@@ -1,33 +1,42 @@
+// Command echo is a minimal WebSocket echo server built on the modern gowest
+// API. It upgrades each request with Accept and echoes every message back to
+// the client using the per-message Read/Write methods.
 package main
 
 import (
-	"fmt"
-	"github.com/ystepanoff/gowest"
+	"context"
+	"log"
 	"net/http"
+
+	"github.com/ystepanoff/gowest"
 )
 
 func main() {
-	http.HandleFunc("/", wsHandler)
-	http.ListenAndServe(":9000", nil)
+	http.HandleFunc("/", echoHandler)
+	log.Println("echo server listening on :9000")
+	log.Fatal(http.ListenAndServe(":9000", nil))
 }
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("connection attempt")
-	conn, bufrw, err := gowest.GetConnection(w, r)
+func echoHandler(w http.ResponseWriter, r *http.Request) {
+	c, err := gowest.Accept(r.Context(), w, r, &gowest.AcceptOptions{
+		OriginPatterns: []string{"*"},
+	})
 	if err != nil {
-		fmt.Println(err)
+		log.Println("accept:", err)
 		return
 	}
-	defer conn.Close()
+	defer c.Close(gowest.StatusInternalError, "")
+
+	ctx := context.Background()
 	for {
-		msg, err := gowest.Read(bufrw)
+		typ, data, err := c.Read(ctx)
 		if err != nil {
-			fmt.Println(err)
-			break
+			log.Println("read:", err)
+			return
 		}
-		fmt.Println(string(msg))
-		if err := gowest.WriteString(bufrw, msg); err != nil {
-			fmt.Println(err)
+		if err := c.Write(ctx, typ, data); err != nil {
+			log.Println("write:", err)
+			return
 		}
 	}
 }

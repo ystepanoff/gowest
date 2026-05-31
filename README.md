@@ -1,25 +1,34 @@
 # gowest
 
-A lightweight Go WebSocket library that offers fine-grained control over the WebSocket handshake and frame parsing.
+A minimal, dependency-free WebSocket library for Go with a modern, context-first API.
 
 ![GoWest](GoWest.png)
 
 ## Overview
-**gowest** is a simple Go library that provides a low-level interface for creating and handling WebSocket connections. Rather than relying on a higher-level library, **gowest** aims to give you control over:
+**gowest** offers a small, ergonomic API built around a single `Conn` type that is safe to use from multiple goroutines. It is a lightweight alternative to `gorilla/websocket` with:
 
-* The initial WebSocket handshake and headers
-* Reading and writing raw WebSocket frames
-* Handling the basic life cycle of a WebSocket connection
+* A context-first API — `Read`, `Write` and `Accept` all honour `context.Context` deadlines and cancellation.
+* Safe concurrent writes — any number of goroutines may call `Write`; frames never interleave.
+* An explicit one-reader rule — at most one goroutine calls `Read` at a time.
+* Transparent control-frame handling — ping/pong and close frames are handled for you.
+* Origin checking and subprotocol negotiation.
+* No external dependencies.
 
 ## Features
 
-- [x] Handshake: Manually handles WebSocket upgrade, including necessary headers.
+- [x] Handshake: `Accept` performs the RFC 6455 upgrade with origin checking.
 - [x] Frame Parsing: Reads and writes WebSocket frames in compliance with RFC 6455.
-- [x] Binary and Text Frames: Currently supports sending/receiving binary or text data.
-- [ ] Ping/Pong: Planned
-- [ ] Close Frames: Planned
-- [ ] Subprotocols: Planned
-- [ ] Compression: Planned
+- [x] Binary and Text Frames: Send and receive binary or text messages, including fragments.
+- [x] Ping/Pong: Pings are answered automatically; pongs are ignored.
+- [x] Close Frames: Proper close handshake with status codes via `Close`.
+- [x] Subprotocols: Negotiated from `AcceptOptions.Subprotocols`.
+- [ ] Compression: Planned (no permessage-deflate yet).
+
+## Concurrency contract
+
+* `Write` may be called concurrently from multiple goroutines; writes are serialized internally.
+* `Read` must be called from at most one goroutine at a time.
+* `Close` is safe to call concurrently with `Read` and `Write`, and is idempotent.
 
 ## Installation
 ```bash
@@ -35,12 +44,12 @@ import (
 
 ## Basic usage
 
-Below is a simple HTTP server that uses gowest to upgrade connections to WebSocket.
+Below is a simple echo server using the modern `Accept` API.
 ```go
 package main
 
 import (
-    "fmt"
+    "context"
     "log"
     "net/http"
 
@@ -48,26 +57,24 @@ import (
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
-    conn, bufrw, err := gowest.GetConnection(w, r)
+    c, err := gowest.Accept(r.Context(), w, r, &gowest.AcceptOptions{
+        OriginPatterns: []string{"*"}, // allow any origin; tighten in production
+    })
     if err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
+        log.Println("accept:", err)
         return
     }
-    defer conn.Close()
+    defer c.Close(gowest.StatusInternalError, "")
 
-    // Continuously read messages from the client
+    ctx := context.Background()
     for {
-        msg, err := gowest.Read(bufrw)
+        typ, data, err := c.Read(ctx)
         if err != nil {
-            log.Println("Error reading message:", err)
+            log.Println("read:", err) // *gowest.CloseError on a clean close
             return
         }
-        fmt.Printf("Message received: %s\n", msg)
-
-        // Echo the message back
-        err = gowest.WriteString(bufrw, []byte("Echo: "+string(msg)))
-        if err != nil {
-            log.Println("Error writing message:", err)
+        if err := c.Write(ctx, typ, data); err != nil {
+            log.Println("write:", err)
             return
         }
     }
@@ -80,18 +87,34 @@ func main() {
 }
 ```
 
-* **Upgrade connection**: `gowest.GetConnection` upgrades the connection to a WebSocket and returns the hijacked `net.Conn` and a buffered reader/writer.
-* **Read messages**: `gowest.Read` blocks until a full message is received (including fragmented frames).
-* **Write messages**: `gowest.WriteString` sends a single text frame back to the client.
+A runnable version lives in [`examples/echo`](examples/echo).
+
+* **Upgrade**: `gowest.Accept` validates the handshake, checks the origin, negotiates a subprotocol and returns a `*Conn`.
+* **Read**: `(*Conn).Read` blocks until a complete message is available, handling ping/pong and close frames transparently. Call it from at most one goroutine.
+* **Write**: `(*Conn).Write` sends a single message and is safe to call concurrently.
+* **Close**: `(*Conn).Close` performs the close handshake with a `StatusCode` and reason.
+
+### Options
+
+`AcceptOptions` controls the handshake:
+
+| Field | Meaning |
+| --- | --- |
+| `OriginPatterns` | Allowed Origin host patterns (supports a single `*` wildcard). Empty = same-origin only. |
+| `Subprotocols` | Server-preferred subprotocols; the first match with the client is negotiated. |
+| `MaxMessageBytes` | Maximum inbound message size; larger messages fail with `StatusMessageTooBig`. Unset (≤ 0) uses `DefaultMaxMessageBytes` (32 MiB), so connections are bounded by default. |
+| `ReadBufferSize` / `WriteBufferSize` | Buffer sizes for the hijacked connection. |
+
+## Migrating from the legacy API
+
+The original `GetConnection`, `Read` and `WriteString` functions remain available but are **deprecated**. Prefer `Accept` and the `Conn` methods, which add context support, concurrency safety, origin checks and control-frame handling.
 
 ## Roadmap
 
-* Ping/Pong support: Respond to pings and send pings for keep-alive.
-* Close frames: Proper handling of WebSocket close frames and status codes.
-* Subprotocol negotiation: Inspect Sec-WebSocket-Protocol header and pick a subprotocol if desired.
-* Compression: Per-message deflate or other compression mechanisms.
-* Error/Logging improvements: More detailed errors, built-in logging hooks, etc.
-* TLS support: Helper methods to run over HTTPS/TLS (wss://).
+* Compression: per-message deflate.
+* Client-side dialing (`Dial`).
+* A dedicated writer goroutine as an alternative to the write mutex.
+* TLS helpers for `wss://`.
 
 ## Contributing
 
