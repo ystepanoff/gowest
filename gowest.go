@@ -2,15 +2,19 @@ package gowest
 
 import (
 	"bufio"
-	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 
 	"github.com/ystepanoff/gowest/internal/utils"
 )
 
+// GetConnection upgrades an HTTP request to a WebSocket connection and returns
+// the hijacked net.Conn and its buffered reader/writer.
+//
+// Deprecated: use Accept, which returns a *Conn with a context-first API, safe
+// concurrent writes, origin checking and control-frame handling. GetConnection
+// remains for backwards compatibility and performs no origin validation.
 func GetConnection(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -23,7 +27,7 @@ func GetConnection(
 	}
 	key := []byte(r.Header.Get("Sec-Websocket-Key"))
 	if key == nil {
-		return nil, nil, errors.New("Sec-Websocoket-Key expected")
+		return nil, nil, errors.New("sec-Websocket-Key expected")
 	}
 	acceptStr := utils.WSSecKey(key)
 	hj, ok := w.(http.Hijacker)
@@ -52,124 +56,30 @@ func GetConnection(
 	return conn, bufrw, nil
 }
 
+// Read reads a complete (possibly fragmented) message from bufrw.
+//
+// Deprecated: use (*Conn).Read, which honours a context, handles control frames
+// and reports message types. Read is retained for backwards compatibility.
 func Read(bufrw *bufio.ReadWriter) ([]byte, error) {
 	var message []byte
 	for {
-		frame, err := wsReadFrame(bufrw)
+		f, err := readFrame(bufrw.Reader, 0)
 		if err != nil {
 			return nil, err
 		}
-		message = append(message, frame.payload...)
-		if frame.isFinal {
+		message = append(message, f.payload...)
+		if f.fin {
 			break
 		}
 	}
 	return message, nil
 }
 
+// WriteString writes message as a single final text frame to bufrw.
+//
+// Deprecated: use (*Conn).Write, which serializes concurrent writes and accepts
+// a context and message type. WriteString is retained for backwards
+// compatibility.
 func WriteString(bufrw *bufio.ReadWriter, message []byte) error {
-	frame := wsFrame{
-		uint64(len(message)),
-		1,
-		true,
-		message,
-	}
-	if err := wsWriteFrame(bufrw, frame); err != nil {
-		return err
-	}
-	return nil
-}
-
-type wsFrame struct {
-	length  uint64
-	opCode  byte
-	isFinal bool
-	payload []byte
-}
-
-func wsReadFrame(bufrw *bufio.ReadWriter) (*wsFrame, error) {
-	header := make([]byte, 2, 12)
-	if _, err := bufrw.Read(header); err != nil {
-		return nil, err
-	}
-	finalBit := header[0] >> 7
-	opCode := header[0] & 0xf
-	maskBit := header[1] >> 7
-	extra := 0
-	if maskBit == 1 {
-		extra += 4
-	}
-	size := uint64(header[1] & 0x7f)
-	switch size {
-	case 126:
-		extra += 2
-	case 127:
-		extra += 8
-	}
-	if extra > 0 {
-		header = header[:extra]
-		if _, err := bufrw.Read(header); err != nil {
-			return nil, err
-		}
-		switch size {
-		case 126:
-			size = uint64(binary.BigEndian.Uint16(header[:2]))
-			header = header[2:]
-		case 127:
-			size = binary.BigEndian.Uint64(header[:8])
-			header = header[8:]
-		}
-	}
-	var mask []byte
-	if maskBit == 1 {
-		mask = header
-	}
-	payload := make([]byte, int(size))
-	if _, err := io.ReadFull(bufrw, payload); err != nil {
-		return nil, err
-	}
-	if maskBit == 1 {
-		for i := 0; i < len(payload); i++ {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	frame := &wsFrame{}
-	frame.length = size
-	frame.opCode = opCode
-	if finalBit == 1 {
-		frame.isFinal = true
-	} else {
-		frame.isFinal = false
-	}
-	frame.payload = payload
-	return frame, nil
-}
-
-func wsWriteFrame(bufrw *bufio.ReadWriter, frame wsFrame) error {
-	buf := make([]byte, 2)
-	buf[0] |= frame.opCode
-	if frame.isFinal {
-		buf[0] |= 0x80
-	}
-	if frame.length < 126 {
-		buf[1] |= byte(frame.length)
-	} else if frame.length < 1<<16 {
-		buf[1] |= 126
-		size := make([]byte, 2)
-		binary.BigEndian.PutUint16(size, uint16(frame.length))
-		buf = append(buf, size...)
-	} else {
-		buf[1] |= 127
-		size := make([]byte, 8)
-		binary.BigEndian.PutUint64(size, frame.length)
-		buf = append(buf, size...)
-	}
-	buf = append(buf, frame.payload...)
-	if _, err := bufrw.Write(buf); err != nil {
-		return err
-	}
-	if err := bufrw.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return writeFrame(bufrw.Writer, frame{fin: true, opcode: opText, payload: message})
 }
