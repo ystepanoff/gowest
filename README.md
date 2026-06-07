@@ -26,7 +26,7 @@ A minimal, dependency-free WebSocket library for Go with a modern, context-first
 
 ## Concurrency contract
 
-* `Write` may be called concurrently from multiple goroutines; writes are serialized internally.
+* `Write` may be called concurrently from multiple goroutines; writes are serialised internally.
 * `Read` must be called from at most one goroutine at a time.
 * `Close` is safe to call concurrently with `Read` and `Write`, and is idempotent.
 

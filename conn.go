@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // MessageType identifies the kind of a WebSocket data message.
@@ -30,8 +31,8 @@ func (t MessageType) opcode() byte {
 //
 // A Conn is safe for concurrent use under the contract documented on the
 // package: any number of goroutines may call Write simultaneously, at most one
-// goroutine may call Read at a time, and Close may be called concurrently with
-// either. See the package documentation for details.
+// goroutine may call Read at a time, and Close and Ping may be called
+// concurrently with either. See the package documentation for details.
 type Conn struct {
 	conn net.Conn
 	br   *bufio.Reader
@@ -40,13 +41,22 @@ type Conn struct {
 	subprotocol string
 	maxMessage  int64
 
-	// writeMu serializes writes so concurrent Write calls never interleave
+	// writeMu serialises writes so concurrent Write calls never interleave
 	// frames on the wire.
 	writeMu sync.Mutex
 
 	// closeMu guards the close handshake state below.
 	closeMu   sync.Mutex
 	closeSent bool
+
+	// handlerMu guards the optional ping/pong observation handlers.
+	handlerMu   sync.Mutex
+	pingHandler func(payload []byte)
+	pongHandler func(payload []byte)
+
+	// pingMu guards the set of goroutines blocked in Ping awaiting a pong.
+	pingMu      sync.Mutex
+	pongWaiters []chan struct{}
 
 	// closeOnce ensures the underlying connection is torn down exactly once.
 	closeOnce sync.Once
@@ -71,13 +81,35 @@ func (c *Conn) Subprotocol() string {
 	return c.subprotocol
 }
 
+// SetPingHandler registers a function invoked whenever a ping frame is
+// received, after Read has already replied with the matching pong (gowest
+// always answers pings automatically). The handler is purely observational and
+// runs on the goroutine that called Read; it must not block. Pass nil to clear
+// it. SetPingHandler may be called concurrently with Read.
+func (c *Conn) SetPingHandler(h func(payload []byte)) {
+	c.handlerMu.Lock()
+	c.pingHandler = h
+	c.handlerMu.Unlock()
+}
+
+// SetPongHandler registers a function invoked whenever a pong frame is
+// received, whether solicited by Ping or sent unsolicited by the peer. It runs
+// on the goroutine that called Read and must not block. Pass nil to clear it.
+// SetPongHandler may be called concurrently with Read.
+func (c *Conn) SetPongHandler(h func(payload []byte)) {
+	c.handlerMu.Lock()
+	c.pongHandler = h
+	c.handlerMu.Unlock()
+}
+
 // Read reads the next data message from the connection. It blocks until a
 // complete message (across any number of fragment frames) is available, the
 // context is cancelled, or the connection is closed.
 //
 // Read transparently answers ping frames with pongs and discards incoming
 // pongs. If the peer sends a close frame, Read echoes it and returns a
-// *CloseError.
+// *CloseError. A framing or UTF-8 violation by the peer fails the connection
+// and returns a *ProtocolError after relaying the status code to the peer.
 //
 // Read must not be called from more than one goroutine at a time.
 func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
@@ -97,27 +129,24 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 		}
 
 		switch f.opcode {
-		case opClose:
-			code, reason := parseClosePayload(f.payload)
-			ce := &CloseError{Code: code, Reason: reason}
-			c.replyClose(code, reason)
-			c.fail(ce)
-			return 0, nil, ce
-
 		case opPing:
 			if err := c.writeControl(opPong, f.payload); err != nil {
-				return 0, nil, c.fail(err)
+				return 0, nil, c.fail(c.contextError(ctx, err))
 			}
+			c.invokePingHandler(f.payload)
 			continue
 
 		case opPong:
+			c.notePong()
+			c.invokePongHandler(f.payload)
 			continue
+
+		case opClose:
+			return 0, nil, c.handleClose(f.payload)
 
 		case opText, opBinary:
 			if fragment {
-				err := &CloseError{Code: StatusProtocolError, Reason: "expected continuation frame"}
-				c.replyClose(err.Code, err.Reason)
-				return 0, nil, c.fail(err)
+				return 0, nil, c.abortProtocol(&ProtocolError{Code: StatusProtocolError, Reason: "expected continuation frame"})
 			}
 			if f.opcode == opBinary {
 				msgType = MessageBinary
@@ -128,33 +157,56 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 
 		case opContinuation:
 			if !fragment {
-				err := &CloseError{Code: StatusProtocolError, Reason: "unexpected continuation frame"}
-				c.replyClose(err.Code, err.Reason)
-				return 0, nil, c.fail(err)
+				return 0, nil, c.abortProtocol(&ProtocolError{Code: StatusProtocolError, Reason: "unexpected continuation frame"})
 			}
 			message = append(message, f.payload...)
 
 		default:
-			err := &CloseError{Code: StatusProtocolError, Reason: "unknown opcode"}
-			c.replyClose(err.Code, err.Reason)
-			return 0, nil, c.fail(err)
+			// Unreachable: readFrame rejects reserved opcodes before we get
+			// here. Kept as defence in depth.
+			return 0, nil, c.abortProtocol(&ProtocolError{Code: StatusProtocolError, Reason: "unknown opcode"})
 		}
 
 		if c.maxMessage > 0 && int64(len(message)) > c.maxMessage {
-			err := &CloseError{Code: StatusMessageTooBig, Reason: "message exceeds max size"}
-			c.replyClose(err.Code, err.Reason)
-			return 0, nil, c.fail(err)
+			return 0, nil, c.abortProtocol(&ProtocolError{Code: StatusMessageTooBig, Reason: "message exceeds max size"})
 		}
 
-		if f.fin {
-			return msgType, message, nil
+		if !f.fin {
+			fragment = true
+			continue
 		}
-		fragment = true
+
+		// A complete text message must be valid UTF-8 (RFC 6455 section 8.1).
+		if msgType == MessageText && !utf8.Valid(message) {
+			return 0, nil, c.abortProtocol(&ProtocolError{Code: StatusInvalidFramePayloadData, Reason: "invalid UTF-8 in text message"})
+		}
+		return msgType, message, nil
 	}
 }
 
+// handleClose processes an inbound close frame: it validates the payload,
+// echoes a close back to the peer and fails the connection. It returns the
+// *CloseError describing the peer's close, or a *ProtocolError if the payload
+// was malformed.
+func (c *Conn) handleClose(payload []byte) error {
+	code, reason, err := parseClosePayload(payload)
+	if err != nil {
+		var pe *ProtocolError
+		errors.As(err, &pe)
+		return c.abortProtocol(pe)
+	}
+	// Echo the close (RFC 6455 section 5.5.1). closePayload suppresses the
+	// reserved 1005 "no status" code, producing an empty close frame. The
+	// reason is echoed back verbatim; it already passed parseClosePayload's
+	// UTF-8 and length checks, so it fits the control-frame limit.
+	c.replyClose(code, reason)
+	ce := &CloseError{Code: code, Reason: reason}
+	c.fail(ce)
+	return ce
+}
+
 // Write sends a single data message of the given type to the peer. It may be
-// called concurrently from multiple goroutines; writes are serialized so frames
+// called concurrently from multiple goroutines; writes are serialised so frames
 // never interleave.
 func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error {
 	if typ != MessageText && typ != MessageBinary {
@@ -182,25 +234,91 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error
 	return nil
 }
 
+// Ping sends a ping frame to the peer and blocks until a pong is received, the
+// context is cancelled, or the connection is closed. Because pongs are observed
+// by Read, a goroutine must be calling Read concurrently for Ping to complete;
+// otherwise Ping blocks until ctx expires.
+//
+// Ping returns nil once a pong arrives, ctx.Err() if the context is cancelled
+// first, or the connection's failure cause (for example ErrClosed) if the
+// connection is torn down. Any pong satisfies a pending Ping; the ping payload
+// is empty.
+func (c *Conn) Ping(ctx context.Context) error {
+	select {
+	case <-c.done:
+		return c.closeErr
+	default:
+	}
+
+	ch := make(chan struct{}, 1)
+	c.pingMu.Lock()
+	c.pongWaiters = append(c.pongWaiters, ch)
+	c.pingMu.Unlock()
+
+	if err := c.writeControl(opPing, nil); err != nil {
+		c.removePongWaiter(ch)
+		return c.fail(c.contextError(ctx, err))
+	}
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		c.removePongWaiter(ch)
+		return ctx.Err()
+	case <-c.done:
+		c.removePongWaiter(ch)
+		return c.closeErr
+	}
+}
+
+// notePong wakes every goroutine currently blocked in Ping. Any pong is treated
+// as satisfying all outstanding pings, which is sufficient for liveness checks
+// and avoids fragile payload correlation across coalesced pongs.
+func (c *Conn) notePong() {
+	c.pingMu.Lock()
+	for _, ch := range c.pongWaiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	c.pongWaiters = nil
+	c.pingMu.Unlock()
+}
+
+// removePongWaiter discards a waiter that gave up before a pong arrived.
+func (c *Conn) removePongWaiter(ch chan struct{}) {
+	c.pingMu.Lock()
+	for i, w := range c.pongWaiters {
+		if w == ch {
+			c.pongWaiters = append(c.pongWaiters[:i], c.pongWaiters[i+1:]...)
+			break
+		}
+	}
+	c.pingMu.Unlock()
+}
+
 // Close sends a close frame with the given status code and reason to the peer
 // and tears down the underlying connection. It is safe to call concurrently
-// with Read and Write and is idempotent: only the first call performs the
+// with Read, Write and Ping and is idempotent: only the first call performs the
 // handshake, and subsequent calls return nil.
 //
+// After Close, in-flight and future Read, Write and Ping calls observe
+// ErrClosed (a peer-initiated close is reported as a *CloseError instead).
+//
 // The reason must be at most 123 bytes once combined with the two-byte status
-// code, per RFC 6455's 125-byte control-frame limit.
+// code, per RFC 6455's 125-byte control-frame limit; longer reasons are
+// truncated.
 func (c *Conn) Close(code StatusCode, reason string) error {
-	if len(reason) > maxControlPayload-2 {
-		reason = reason[:maxControlPayload-2]
-	}
 	c.replyClose(code, reason)
-	c.fail(&CloseError{Code: code, Reason: reason})
+	c.fail(ErrClosed)
 	return nil
 }
 
 // replyClose sends a close frame at most once for the lifetime of the
-// connection. Errors are ignored because the connection is being torn down
-// regardless.
+// connection. The reason is truncated to fit the 125-byte control-frame limit.
+// Errors are ignored because the connection is being torn down regardless.
 func (c *Conn) replyClose(code StatusCode, reason string) {
 	c.closeMu.Lock()
 	if c.closeSent {
@@ -210,10 +328,13 @@ func (c *Conn) replyClose(code StatusCode, reason string) {
 	c.closeSent = true
 	c.closeMu.Unlock()
 
+	if len(reason) > maxControlPayload-2 {
+		reason = reason[:maxControlPayload-2]
+	}
 	_ = c.writeControl(opClose, closePayload(code, reason))
 }
 
-// writeControl serializes a control frame against concurrent data writes.
+// writeControl serialises a control frame against concurrent data writes.
 func (c *Conn) writeControl(opcode byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -224,12 +345,42 @@ func (c *Conn) writeControl(opcode byte, payload []byte) error {
 	return writeFrame(c.bw, frame{fin: true, opcode: opcode, payload: payload})
 }
 
+// invokePingHandler calls the registered ping handler, if any, with a snapshot
+// taken under the handler lock so a concurrent SetPingHandler is safe.
+func (c *Conn) invokePingHandler(payload []byte) {
+	c.handlerMu.Lock()
+	h := c.pingHandler
+	c.handlerMu.Unlock()
+	if h != nil {
+		h(payload)
+	}
+}
+
+// invokePongHandler mirrors invokePingHandler for pong frames.
+func (c *Conn) invokePongHandler(payload []byte) {
+	c.handlerMu.Lock()
+	h := c.pongHandler
+	c.handlerMu.Unlock()
+	if h != nil {
+		h(payload)
+	}
+}
+
+// abortProtocol relays a protocol violation to the peer as a close frame
+// carrying its status code, fails the connection, and returns the violation as
+// the cause future operations will report.
+func (c *Conn) abortProtocol(pe *ProtocolError) error {
+	c.replyClose(pe.Code, pe.Reason)
+	c.fail(pe)
+	return pe
+}
+
 // fail closes the underlying connection exactly once, recording the cause that
 // in-flight and future operations should report. It always returns that cause.
 func (c *Conn) fail(cause error) error {
 	c.closeOnce.Do(func() {
 		if cause == nil {
-			cause = net.ErrClosed
+			cause = ErrClosed
 		}
 		c.closeErr = cause
 		c.bw.Flush()
@@ -244,9 +395,9 @@ func (c *Conn) fail(cause error) error {
 // or a deadline. Protocol violations surfaced by the frame parser are relayed
 // to the peer as a close frame before the connection is failed.
 func (c *Conn) readError(ctx context.Context, err error) error {
-	var ce *CloseError
-	if errors.As(err, &ce) {
-		c.replyClose(ce.Code, ce.Reason)
+	var pe *ProtocolError
+	if errors.As(err, &pe) {
+		return c.abortProtocol(pe)
 	}
 	return c.fail(c.contextError(ctx, err))
 }

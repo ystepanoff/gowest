@@ -31,7 +31,7 @@
 // production WebSocket libraries:
 //
 //   - Write may be called concurrently from multiple goroutines. Writes are
-//     serialized internally with a mutex so that frames never interleave.
+//     serialised internally with a mutex so that frames never interleave.
 //   - Read must be called from at most one goroutine at a time. Reading from
 //     several goroutines concurrently is a programming error and corrupts the
 //     message stream.
@@ -51,11 +51,28 @@
 //
 // Read transparently handles control frames: incoming pings are answered with a
 // pong, pongs are ignored, and a close frame causes Read to return a *CloseError
-// after echoing the close back to the peer.
+// after echoing the close back to the peer. Call Ping to send a ping and block
+// until the peer's pong is observed by a concurrent Read. SetPingHandler and
+// SetPongHandler register optional, non-blocking observers for received control
+// frames; they do not replace the automatic pong reply.
+//
+// # Errors
+//
+// Read, Write and Ping return typed errors callers can match:
+//
+//   - ErrClosed is reported once the connection has been closed locally, for
+//     example by Close. Test for it with errors.Is.
+//   - A *CloseError is returned by Read when the peer sends a close frame, and
+//     is the cause later operations report for a peer-initiated close.
+//   - A *ProtocolError is returned when the peer violates the framing protocol
+//     (an unmasked frame, an unknown opcode, an oversized or fragmented control
+//     frame, a malformed close payload, or invalid UTF-8 in a text message).
+//     The connection is failed and the corresponding status code is relayed to
+//     the peer in a close frame. Inspect both with errors.As.
 //
 // # Limitations
 //
-// This release uses a mutex to serialize writes rather than a dedicated writer
+// This release uses a mutex to serialise writes rather than a dedicated writer
 // goroutine, does not implement permessage-deflate compression, and has no
 // external dependencies. The legacy GetConnection, Read and WriteString
 // functions remain available but are deprecated in favour of Accept and the
