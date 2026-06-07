@@ -77,7 +77,7 @@ func Read(bufrw *bufio.ReadWriter) ([]byte, error) {
 
 // WriteString writes message as a single final text frame to bufrw.
 //
-// Deprecated: use (*Conn).Write, which serializes concurrent writes and accepts
+// Deprecated: use (*Conn).Write, which serialises concurrent writes and accepts
 // a context and message type. WriteString is retained for backwards
 // compatibility.
 func WriteString(bufrw *bufio.ReadWriter, message []byte) error {
