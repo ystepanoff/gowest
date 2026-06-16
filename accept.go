@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/ystepanoff/gowest/internal/utils"
 )
@@ -69,6 +71,13 @@ func Accept(ctx context.Context, w http.ResponseWriter, r *http.Request, opts *A
 		opts = &AcceptOptions{}
 	}
 
+	// Honour cancellation before doing any handshake work: if the caller's
+	// context is already done there is no point validating headers or hijacking.
+	if err := ctx.Err(); err != nil {
+		http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+		return nil, err
+	}
+
 	if !strings.EqualFold(r.Method, http.MethodGet) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return nil, errors.New("gowest: handshake requires GET")
@@ -123,13 +132,23 @@ func Accept(ctx context.Context, w http.ResponseWriter, r *http.Request, opts *A
 	}
 	b.WriteString("\r\n")
 
+	// Bound the handshake write by ctx: a cancellation or deadline interrupts a
+	// stalled write so Accept cannot block indefinitely sending the 101
+	// response. A watcher goroutine pushes a past deadline onto the hijacked
+	// connection on cancellation; stopHandshake joins it before we hand the
+	// connection to newConn with a clean (zero) deadline.
+	// Deferred so the watcher is always joined and the deadline restored even
+	// if a write panics; it is idempotent-safe to run once at function exit.
+	stopHandshake := applyHandshakeDeadline(ctx, netConn)
+	defer stopHandshake()
+
 	if _, err := brw.WriteString(b.String()); err != nil {
 		netConn.Close()
-		return nil, err
+		return nil, handshakeError(ctx, err)
 	}
 	if err := brw.Flush(); err != nil {
 		netConn.Close()
-		return nil, err
+		return nil, handshakeError(ctx, err)
 	}
 
 	// Reuse the hijacked reader: it may already hold bytes the client
@@ -218,6 +237,51 @@ func matchOriginPattern(pattern, host string) bool {
 	return len(host) >= len(prefix)+len(suffix) &&
 		strings.HasPrefix(host, prefix) &&
 		strings.HasSuffix(host, suffix)
+}
+
+// applyHandshakeDeadline bounds the handshake response write by ctx using the
+// hijacked connection's deadline, mirroring (*Conn).applyDeadline. It returns a
+// stop function that joins the watcher goroutine and restores a zero deadline,
+// so the connection handed to newConn carries no leftover deadline and no
+// goroutine leaks.
+func applyHandshakeDeadline(ctx context.Context, conn net.Conn) func() {
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetWriteDeadline(deadline)
+	} else {
+		conn.SetWriteDeadline(time.Time{})
+	}
+
+	if ctx.Done() == nil {
+		return func() { conn.SetWriteDeadline(time.Time{}) }
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			conn.SetWriteDeadline(deadlineInThePast)
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+		conn.SetWriteDeadline(time.Time{})
+	}
+}
+
+// handshakeError prefers ctx.Err() over the opaque timeout a cancellation
+// triggers, so a caller that cancelled the handshake sees the context cause.
+func handshakeError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		var ne net.Error
+		if errors.Is(err, net.ErrClosed) || (errors.As(err, &ne) && ne.Timeout()) {
+			return ctxErr
+		}
+	}
+	return err
 }
 
 // headerContainsToken reports whether the named header holds the given token in

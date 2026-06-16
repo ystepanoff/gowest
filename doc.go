@@ -41,11 +41,19 @@
 //
 // # Context
 //
-// Read, Write and Accept honour the supplied context.Context. If the context
-// carries a deadline it is applied to the underlying network operation, and if
-// the context is cancelled the blocked operation is interrupted and returns the
-// context's error. A cancelled or timed-out Read or Write fails the connection,
-// because the WebSocket frame stream cannot be safely resumed mid-frame.
+// Accept, Read, Write and Ping honour the supplied context.Context. If the
+// context carries a deadline it is applied to the underlying network operation
+// via the connection's deadline, and if the context is cancelled the blocked
+// operation is interrupted and returns the context's error. Cancellation is
+// implemented with net.Conn deadlines rather than a per-call goroutine that
+// outlives the operation: a short-lived watcher is always joined before the
+// call returns, so no goroutine leaks and no deadline outlives its operation.
+//
+// A cancelled or timed-out Read or Write fails the connection, because the
+// WebSocket frame stream cannot be safely resumed mid-frame. Close does not
+// take a context; it bounds the close-frame write with a short internal
+// deadline so it cannot block indefinitely on an unresponsive peer, and it
+// unblocks any Read, Write or Ping concurrently in flight.
 //
 // # Control frames
 //

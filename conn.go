@@ -10,6 +10,15 @@ import (
 	"unicode/utf8"
 )
 
+// deadlineInThePast is an already-elapsed deadline used to interrupt a blocked
+// net.Conn operation immediately. Any fixed time in the past works; the Unix
+// epoch + 1s is well clear of the zero Time that means "no deadline".
+var deadlineInThePast = time.Unix(1, 0)
+
+// closeWriteTimeout bounds how long Close waits to put its close frame on the
+// wire before giving up and tearing the connection down regardless.
+const closeWriteTimeout = 5 * time.Second
+
 // MessageType identifies the kind of a WebSocket data message.
 type MessageType int
 
@@ -61,7 +70,15 @@ type Conn struct {
 	// closeOnce ensures the underlying connection is torn down exactly once.
 	closeOnce sync.Once
 	done      chan struct{}
-	closeErr  error
+
+	// causeMu guards closeErr/causeSet. The cause is recorded first-writer-wins
+	// so a locally-initiated Close (or a peer close / protocol abort) attributes
+	// the intended error even when an in-flight operation it evicted reaches
+	// fail first with a raw timeout. closeErr is read without the lock only
+	// after done is closed, which happens-after the recording write.
+	causeMu  sync.Mutex
+	causeSet bool
+	closeErr error
 }
 
 func newConn(c net.Conn, br *bufio.Reader, bw *bufio.Writer, subprotocol string, maxMessage int64) *Conn {
@@ -112,7 +129,15 @@ func (c *Conn) SetPongHandler(h func(payload []byte)) {
 // and returns a *ProtocolError after relaying the status code to the peer.
 //
 // Read must not be called from more than one goroutine at a time.
+//
+// Cancelling ctx mid-frame fails the connection: a partially consumed frame
+// leaves the read stream at an indeterminate position, so the connection cannot
+// safely be reused and subsequent operations observe the cancellation cause.
 func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
+
 	stop := c.applyDeadline(ctx, func(t time.Time) { c.conn.SetReadDeadline(t) })
 	defer stop()
 
@@ -195,12 +220,15 @@ func (c *Conn) handleClose(payload []byte) error {
 		errors.As(err, &pe)
 		return c.abortProtocol(pe)
 	}
+	ce := &CloseError{Code: code, Reason: reason}
+	// Record before replyClose evicts any in-flight writer, so concurrent
+	// operations attribute the peer's CloseError rather than a raw timeout.
+	c.recordCause(ce)
 	// Echo the close (RFC 6455 section 5.5.1). closePayload suppresses the
 	// reserved 1005 "no status" code, producing an empty close frame. The
 	// reason is echoed back verbatim; it already passed parseClosePayload's
 	// UTF-8 and length checks, so it fits the control-frame limit.
 	c.replyClose(code, reason)
-	ce := &CloseError{Code: code, Reason: reason}
 	c.fail(ce)
 	return ce
 }
@@ -212,6 +240,9 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error
 	if typ != MessageText && typ != MessageBinary {
 		return errors.New("gowest: invalid message type")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -221,7 +252,7 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error
 	// torn-down socket and surfacing an opaque I/O error.
 	select {
 	case <-c.done:
-		return c.closeErr
+		return c.cause()
 	default:
 	}
 
@@ -244,9 +275,12 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error
 // connection is torn down. Any pong satisfies a pending Ping; the ping payload
 // is empty.
 func (c *Conn) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-c.done:
-		return c.closeErr
+		return c.cause()
 	default:
 	}
 
@@ -255,7 +289,7 @@ func (c *Conn) Ping(ctx context.Context) error {
 	c.pongWaiters = append(c.pongWaiters, ch)
 	c.pingMu.Unlock()
 
-	if err := c.writeControl(opPing, nil); err != nil {
+	if err := c.writePing(ctx); err != nil {
 		c.removePongWaiter(ch)
 		return c.fail(c.contextError(ctx, err))
 	}
@@ -268,8 +302,27 @@ func (c *Conn) Ping(ctx context.Context) error {
 		return ctx.Err()
 	case <-c.done:
 		c.removePongWaiter(ch)
-		return c.closeErr
+		return c.cause()
 	}
+}
+
+// writePing puts a ping frame on the wire, honouring ctx for both its deadline
+// and cancellation. Unlike the bounded control writes used during teardown, the
+// ping write tracks the caller's context so a cancelled Ping unblocks promptly.
+func (c *Conn) writePing(ctx context.Context) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	select {
+	case <-c.done:
+		return c.cause()
+	default:
+	}
+
+	stop := c.applyDeadline(ctx, func(t time.Time) { c.conn.SetWriteDeadline(t) })
+	defer stop()
+
+	return writeFrame(c.bw, frame{fin: true, opcode: opPing})
 }
 
 // notePong wakes every goroutine currently blocked in Ping. Any pong is treated
@@ -307,10 +360,18 @@ func (c *Conn) removePongWaiter(ch chan struct{}) {
 // After Close, in-flight and future Read, Write and Ping calls observe
 // ErrClosed (a peer-initiated close is reported as a *CloseError instead).
 //
+// Close is bounded: it spends at most closeWriteTimeout trying to put the close
+// frame on the wire before tearing the connection down regardless, so it cannot
+// block indefinitely on an unresponsive peer.
+//
 // The reason must be at most 123 bytes once combined with the two-byte status
 // code, per RFC 6455's 125-byte control-frame limit; longer reasons are
 // truncated.
 func (c *Conn) Close(code StatusCode, reason string) error {
+	// Record the intended cause before evicting any in-flight writer in
+	// replyClose, so concurrent operations attribute ErrClosed rather than the
+	// raw timeout their eviction produces.
+	c.recordCause(ErrClosed)
 	c.replyClose(code, reason)
 	c.fail(ErrClosed)
 	return nil
@@ -334,12 +395,25 @@ func (c *Conn) replyClose(code StatusCode, reason string) {
 	_ = c.writeControl(opClose, closePayload(code, reason))
 }
 
-// writeControl serialises a control frame against concurrent data writes.
+// writeControl serialises a control frame against concurrent data writes,
+// bounded by closeWriteTimeout.
+//
+// Before contending for writeMu it sets a past write deadline, which evicts any
+// data Write currently blocked in a send syscall so this control frame (used
+// for the close handshake) cannot deadlock behind an unresponsive peer. A
+// blocked writer holds writeMu and cannot run its own deadline cleanup until it
+// returns, so nothing competes to clear the past deadline and eviction is
+// prompt. Once it holds the lock it installs the real deadline for its own
+// write, bounding the whole operation by closeWriteTimeout. The evicted writer
+// observes a timeout and, because the cause was recorded before teardown,
+// reports the intended close cause.
 func (c *Conn) writeControl(opcode byte, payload []byte) error {
+	c.conn.SetWriteDeadline(deadlineInThePast)
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	c.conn.SetWriteDeadline(time.Now().Add(closeWriteTimeout))
 	defer c.conn.SetWriteDeadline(time.Time{})
 
 	return writeFrame(c.bw, frame{fin: true, opcode: opcode, payload: payload})
@@ -370,6 +444,9 @@ func (c *Conn) invokePongHandler(payload []byte) {
 // carrying its status code, fails the connection, and returns the violation as
 // the cause future operations will report.
 func (c *Conn) abortProtocol(pe *ProtocolError) error {
+	// Record before replyClose evicts any in-flight writer, so it attributes
+	// the protocol error rather than the timeout the eviction produces.
+	c.recordCause(pe)
 	c.replyClose(pe.Code, pe.Reason)
 	c.fail(pe)
 	return pe
@@ -377,16 +454,43 @@ func (c *Conn) abortProtocol(pe *ProtocolError) error {
 
 // fail closes the underlying connection exactly once, recording the cause that
 // in-flight and future operations should report. It always returns that cause.
+//
+// The cause is recorded first-writer-wins: callers that initiated the teardown
+// (Close, abortProtocol, handleClose) record their intended cause before
+// evicting in-flight operations, so a victim that reaches fail first with a raw
+// timeout does not overwrite it.
 func (c *Conn) fail(cause error) error {
 	c.closeOnce.Do(func() {
-		if cause == nil {
-			cause = ErrClosed
-		}
-		c.closeErr = cause
+		c.recordCause(cause)
 		c.bw.Flush()
 		c.conn.Close()
 		close(c.done)
 	})
+	return c.cause()
+}
+
+// recordCause stores the failure cause the first time it is called with a
+// non-nil error; later calls are ignored. A nil cause defaults to ErrClosed.
+func (c *Conn) recordCause(cause error) {
+	if cause == nil {
+		cause = ErrClosed
+	}
+	c.causeMu.Lock()
+	if !c.causeSet {
+		c.causeSet = true
+		c.closeErr = cause
+	}
+	c.causeMu.Unlock()
+}
+
+// cause returns the recorded failure cause, or ErrClosed if none was recorded
+// (which cannot happen once done is closed, but keeps the accessor total).
+func (c *Conn) cause() error {
+	c.causeMu.Lock()
+	defer c.causeMu.Unlock()
+	if !c.causeSet {
+		return ErrClosed
+	}
 	return c.closeErr
 }
 
@@ -418,6 +522,13 @@ func (c *Conn) contextError(ctx context.Context, err error) error {
 // applyDeadline wires a context's cancellation and deadline onto a net.Conn
 // deadline setter. It returns a cleanup function that must be called when the
 // operation completes.
+//
+// When ctx can be cancelled, a watcher goroutine sets a deadline in the past on
+// cancellation, which unblocks the in-flight network call; the operation then
+// observes the resulting timeout error and contextError maps it back to
+// ctx.Err(). The cleanup function joins this watcher before restoring the
+// zero (no-op) deadline, so the past deadline can never outlive the operation
+// and poison a subsequent one, and the goroutine can never leak.
 func (c *Conn) applyDeadline(ctx context.Context, set func(time.Time)) func() {
 	if deadline, ok := ctx.Deadline(); ok {
 		set(deadline)
@@ -430,18 +541,24 @@ func (c *Conn) applyDeadline(ctx context.Context, set func(time.Time)) func() {
 	}
 
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		select {
 		case <-ctx.Done():
 			// Interrupt the blocked network operation; the operation
 			// observes the resulting error and contextError maps it back
 			// to ctx.Err().
-			set(time.Unix(1, 0))
+			set(deadlineInThePast)
 		case <-stop:
 		}
 	}()
 	return func() {
+		// Join the watcher first: once done is closed the watcher has
+		// returned, so no further set() call can be in flight. Only then is
+		// it safe to restore the zero deadline for the next operation.
 		close(stop)
+		<-done
 		set(time.Time{})
 	}
 }
