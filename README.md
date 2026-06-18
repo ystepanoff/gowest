@@ -30,6 +30,38 @@ A minimal, dependency-free WebSocket library for Go with a modern, context-first
 * `Read` must be called from at most one goroutine at a time.
 * `Close` is safe to call concurrently with `Read` and `Write`, and is idempotent.
 
+## Performance
+
+On common, non-compressed workloads gowest matches or beats both
+`gorilla/websocket` and `coder/websocket`, while allocating an order of
+magnitude less per message. Numbers below are a one-message echo round trip over
+a TCP loopback connection, median of 6 runs on an Apple M4 Pro (Go 1.24); a
+single neutral client drives all three servers, so the only variable per row is
+the server library.
+
+| Payload        | gowest        | gorilla          | coder            |
+| -------------- | ------------- | ---------------- | ---------------- |
+| 32 B text      | **15.93 µs**  | 16.06 µs         | 15.93 µs         |
+| 1 KiB binary   | **16.28 µs**  | 16.39 µs         | 17.01 µs         |
+| 64 KiB binary  | **38.83 µs**  | 69.92 µs (+80%)  | 68.49 µs (+76%)  |
+| 1 MiB binary   | **217.9 µs**  | 433.6 µs (+99%)  | 433.6 µs (+99%)  |
+| 5 MiB binary   | **951.7 µs**  | 1567.7 µs (+65%) | 1448.5 µs (+52%) |
+
+| Payload (allocs/op) | gowest | gorilla | coder |
+| ------------------- | ------ | ------- | ----- |
+| 32 B text           | **2**  | 3       | 2     |
+| 1 KiB binary        | **3**  | 6       | 5     |
+| 1 MiB binary        | **3**  | 34      | 31    |
+| 5 MiB binary        | **3**  | 42      | 39    |
+
+Small messages are dominated by ~16 µs of loopback latency, so all three tie
+there; gowest's framing wins show from 64 KiB upward, and it holds a constant
+**3 allocations** (a single payload copy) at every size. `Read` costs one
+allocation, `Write` zero.
+
+See [`BENCHMARKS.md`](BENCHMARKS.md) for the full methodology, all payload sizes
+and how to reproduce the numbers.
+
 ## Installation
 ```bash
 go get github.com/ystepanoff/gowest@latest
