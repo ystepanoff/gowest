@@ -138,8 +138,9 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 		return 0, nil, err
 	}
 
-	stop := c.applyDeadline(ctx, func(t time.Time) { c.conn.SetReadDeadline(t) })
-	defer stop()
+	if g := c.applyDeadline(ctx, readDir); g != nil {
+		defer g.release()
+	}
 
 	var (
 		message  []byte
@@ -178,7 +179,11 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 			} else {
 				msgType = MessageText
 			}
-			message = append(message, f.payload...)
+			// Adopt the frame's payload directly: readFrame allocated it freshly
+			// and does not retain it, so for the common single-frame message we
+			// avoid a second allocation and full copy. A continuation frame, if
+			// one follows, appends onto this slice.
+			message = f.payload
 
 		case opContinuation:
 			if !fragment {
@@ -256,8 +261,9 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, payload []byte) error
 	default:
 	}
 
-	stop := c.applyDeadline(ctx, func(t time.Time) { c.conn.SetWriteDeadline(t) })
-	defer stop()
+	if g := c.applyDeadline(ctx, writeDir); g != nil {
+		defer g.release()
+	}
 
 	if err := writeFrame(c.bw, frame{fin: true, opcode: typ.opcode(), payload: payload}); err != nil {
 		return c.fail(c.contextError(ctx, err))
@@ -319,8 +325,9 @@ func (c *Conn) writePing(ctx context.Context) error {
 	default:
 	}
 
-	stop := c.applyDeadline(ctx, func(t time.Time) { c.conn.SetWriteDeadline(t) })
-	defer stop()
+	if g := c.applyDeadline(ctx, writeDir); g != nil {
+		defer g.release()
+	}
 
 	return writeFrame(c.bw, frame{fin: true, opcode: opPing})
 }
@@ -519,46 +526,99 @@ func (c *Conn) contextError(ctx context.Context, err error) error {
 	return err
 }
 
-// applyDeadline wires a context's cancellation and deadline onto a net.Conn
-// deadline setter. It returns a cleanup function that must be called when the
-// operation completes.
-//
-// When ctx can be cancelled, a watcher goroutine sets a deadline in the past on
-// cancellation, which unblocks the in-flight network call; the operation then
-// observes the resulting timeout error and contextError maps it back to
-// ctx.Err(). The cleanup function joins this watcher before restoring the
-// zero (no-op) deadline, so the past deadline can never outlive the operation
-// and poison a subsequent one, and the goroutine can never leak.
-func (c *Conn) applyDeadline(ctx context.Context, set func(time.Time)) func() {
-	if deadline, ok := ctx.Deadline(); ok {
-		set(deadline)
+// deadlineDir selects which of a connection's two deadlines an operation drives.
+type deadlineDir uint8
+
+const (
+	readDir deadlineDir = iota
+	writeDir
+)
+
+// setDeadline applies t to the read or write deadline. Routing on a small enum
+// rather than a func(time.Time) closure keeps applyDeadline's hot path free of
+// the per-call closure allocation the closure form forced onto the heap (the
+// compiler cannot stack-allocate a closure passed to a method that may retain
+// it).
+func (c *Conn) setDeadline(dir deadlineDir, t time.Time) {
+	if dir == readDir {
+		c.conn.SetReadDeadline(t)
 	} else {
-		set(time.Time{})
+		c.conn.SetWriteDeadline(t)
+	}
+}
+
+// deadlineGuard restores a connection deadline (and joins the cancellation
+// watcher, if any) when an operation completes. applyDeadline returns nil for
+// the common unbounded operation, so the fast path allocates no guard at all;
+// stop is safe to call only on a non-nil guard.
+type deadlineGuard struct {
+	c    *Conn
+	dir  deadlineDir
+	stop chan struct{} // nil when no watcher goroutine was started
+	done chan struct{}
+}
+
+// release joins the watcher (if present) and restores the zero deadline so it
+// cannot outlive the operation and poison a later one.
+func (g *deadlineGuard) release() {
+	if g.stop != nil {
+		// Join the watcher first: once done is closed it has returned, so no
+		// further deadline write can be in flight before we restore zero.
+		close(g.stop)
+		<-g.done
+	}
+	g.c.setDeadline(g.dir, time.Time{})
+}
+
+// applyDeadline wires a context's cancellation and deadline onto the read or
+// write deadline of the connection. It returns a *deadlineGuard whose release
+// method must be called when the operation completes, or nil when the operation
+// is unbounded and needs no cleanup.
+//
+// Fast path: when ctx carries neither a deadline nor a Done channel the
+// operation runs unbounded. A read needs no syscall at all — the read deadline
+// is driven only by Read, which always restores zero, so it is already clear.
+// A write clears the write deadline once, because a concurrent control write
+// (an auto-pong reply or the close handshake) may have left a past deadline on
+// the connection to evict a blocked writer; clearing it stops this fresh write
+// from being failed by that eviction. Neither case allocates a guard.
+//
+// Slow path: when ctx can be cancelled a watcher goroutine sets a past deadline
+// on cancellation, which unblocks the in-flight network call; the operation
+// then observes the resulting timeout and contextError maps it back to
+// ctx.Err(). The guard joins this watcher before restoring the zero deadline,
+// so no goroutine leaks and no deadline outlives its operation.
+func (c *Conn) applyDeadline(ctx context.Context, dir deadlineDir) *deadlineGuard {
+	deadline, hasDeadline := ctx.Deadline()
+	cancellable := ctx.Done() != nil
+
+	if !hasDeadline && !cancellable {
+		if dir == writeDir {
+			c.conn.SetWriteDeadline(time.Time{})
+		}
+		return nil
 	}
 
-	if ctx.Done() == nil {
-		return func() { set(time.Time{}) }
+	if hasDeadline {
+		c.setDeadline(dir, deadline)
+	} else {
+		c.setDeadline(dir, time.Time{})
 	}
 
-	stop := make(chan struct{})
-	done := make(chan struct{})
+	if !cancellable {
+		return &deadlineGuard{c: c, dir: dir}
+	}
+
+	g := &deadlineGuard{c: c, dir: dir, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
-		defer close(done)
+		defer close(g.done)
 		select {
 		case <-ctx.Done():
-			// Interrupt the blocked network operation; the operation
-			// observes the resulting error and contextError maps it back
-			// to ctx.Err().
-			set(deadlineInThePast)
-		case <-stop:
+			// Interrupt the blocked network operation; the operation observes
+			// the resulting error and contextError maps it back to ctx.Err().
+			c.setDeadline(dir, deadlineInThePast)
+		case <-g.stop:
 		}
 	}()
-	return func() {
-		// Join the watcher first: once done is closed the watcher has
-		// returned, so no further set() call can be in flight. Only then is
-		// it safe to restore the zero deadline for the next operation.
-		close(stop)
-		<-done
-		set(time.Time{})
-	}
+	return g
 }
