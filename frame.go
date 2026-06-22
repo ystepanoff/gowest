@@ -110,10 +110,9 @@ func readFrame(r *bufio.Reader, maxPayload int64) (frame, error) {
 	}
 
 	payload := make([]byte, size)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	if err := readMaskedPayload(r, payload, mask); err != nil {
 		return frame{}, err
 	}
-	maskBytes(payload, mask)
 
 	return frame{fin: fin, opcode: opcode, payload: payload}, nil
 }
@@ -189,29 +188,70 @@ func readFrameBig(r *bufio.Reader, maxPayload int64) (frame, error) {
 	}
 
 	payload := make([]byte, size)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	if err := readMaskedPayload(r, payload, mask); err != nil {
 		return frame{}, err
 	}
-	maskBytes(payload, mask)
 
 	return frame{fin: fin, opcode: opcode, payload: payload}, nil
 }
 
-// maskBytes XORs b in place with the four-byte WebSocket mask, eight bytes per
-// iteration. The mask is repeated into an eight-byte word and applied with
-// aligned 64-bit loads/stores via encoding/binary, which the compiler lowers to
-// plain word operations. This is several times faster than a byte-at-a-time
-// loop on large payloads and needs no unsafe: LittleEndian is used for both the
-// load and the store, so the byte permutation cancels out and the result is
-// identical on every architecture.
+// readMaskedPayload fills buf from r and unmasks it in a single pass: each chunk
+// the reader returns is unmasked while it is still hot in cache, before the next
+// chunk is read. Unmasking buf as a whole only after a separate io.ReadFull
+// (the obvious two-pass form) touches the payload twice, which for payloads too
+// large to stay cached doubles the memory traffic and shows up as a regression
+// in the bandwidth-bound regime (≈5 MiB+). Fusing the two keeps a single pass.
 //
-// Because each iteration consumes eight bytes (two full four-byte mask cycles),
-// the mask stays phase-aligned and the byte-wise tail can resume at mask[0].
-func maskBytes(b []byte, mask [4]byte) {
+// The reader (a *bufio.Reader) hands back whatever it has buffered, so chunk
+// boundaries do not align to the four-byte mask period; pos tracks the running
+// offset so each chunk resumes the mask at the correct phase. The io.ReadFull
+// error contract is preserved: a short final read returns io.ErrUnexpectedEOF.
+func readMaskedPayload(r io.Reader, buf []byte, mask [4]byte) error {
+	pos := 0
+	for pos < len(buf) {
+		n, err := r.Read(buf[pos:])
+		if n > 0 {
+			maskBytesOffset(buf[pos:pos+n], mask, pos)
+			pos += n
+		}
+		if err != nil {
+			if err == io.EOF {
+				if pos == len(buf) {
+					return nil
+				}
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// maskBytesOffset XORs b in place with the four-byte WebSocket mask, where b
+// begins offset bytes into the payload. It first rotates the mask to the phase
+// implied by offset, then XORs eight bytes per iteration: the rotated mask is
+// repeated into an eight-byte word and applied with aligned 64-bit loads/stores
+// via encoding/binary, which the compiler lowers to plain word operations. This
+// is several times faster than a byte-at-a-time loop on large payloads and needs
+// no unsafe: LittleEndian is used for both the load and the store, so the byte
+// permutation cancels out and the result is identical on every architecture.
+//
+// Each eight-byte iteration consumes two full four-byte mask cycles, so the
+// phase is preserved and the byte-wise tail resumes at the rotated mask[0]. The
+// offset lets a payload be unmasked across several non-aligned chunks (as the
+// fused read loop does) while keeping every byte XORed against the right mask
+// byte: mask[(offset+i) & 3] for the i-th payload byte.
+func maskBytesOffset(b []byte, mask [4]byte, offset int) {
+	var rm [4]byte
+	rm[0] = mask[offset&3]
+	rm[1] = mask[(offset+1)&3]
+	rm[2] = mask[(offset+2)&3]
+	rm[3] = mask[(offset+3)&3]
+
 	if len(b) >= 8 {
 		var m [8]byte
-		m[0], m[1], m[2], m[3] = mask[0], mask[1], mask[2], mask[3]
-		m[4], m[5], m[6], m[7] = mask[0], mask[1], mask[2], mask[3]
+		m[0], m[1], m[2], m[3] = rm[0], rm[1], rm[2], rm[3]
+		m[4], m[5], m[6], m[7] = rm[0], rm[1], rm[2], rm[3]
 		mw := binary.LittleEndian.Uint64(m[:])
 		for len(b) >= 8 {
 			v := binary.LittleEndian.Uint64(b)
@@ -220,7 +260,7 @@ func maskBytes(b []byte, mask [4]byte) {
 		}
 	}
 	for i := range b {
-		b[i] ^= mask[i&3]
+		b[i] ^= rm[i&3]
 	}
 }
 

@@ -2,10 +2,96 @@ package gowest
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
+
+// TestMaskBytesOffset verifies the phase-aware unmask matches the naive
+// per-byte reference for every starting offset phase and a range of lengths,
+// including the sub-8-byte tail and the 8-byte fast-loop body. This guards the
+// fused single-pass read, which unmasks chunks that begin at arbitrary,
+// non-four-byte-aligned offsets.
+func TestMaskBytesOffset(t *testing.T) {
+	mask := [4]byte{0x11, 0x22, 0x33, 0x44}
+	for offset := 0; offset < 8; offset++ {
+		for n := 0; n <= 40; n++ {
+			data := make([]byte, n)
+			for i := range data {
+				data[i] = byte(i * 7)
+			}
+			got := append([]byte(nil), data...)
+			maskBytesOffset(got, mask, offset)
+
+			want := append([]byte(nil), data...)
+			for i := range want {
+				want[i] ^= mask[(offset+i)&3]
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("offset=%d n=%d: got %x, want %x", offset, n, got, want)
+			}
+		}
+	}
+}
+
+// chunkReader returns data in fixed-size chunks (the final chunk may be
+// shorter), forcing readMaskedPayload through several non-aligned reads so the
+// per-chunk mask phase is exercised. A chunk size that is not a multiple of four
+// guarantees chunk boundaries fall at every mask phase.
+type chunkReader struct {
+	data  []byte
+	chunk int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := r.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	if n > len(r.data) {
+		n = len(r.data)
+	}
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestReadMaskedPayloadChunked confirms the fused read unmasks correctly when
+// the payload arrives in many small, non-four-byte-aligned chunks, and that a
+// truncated stream yields io.ErrUnexpectedEOF (io.ReadFull's contract).
+func TestReadMaskedPayloadChunked(t *testing.T) {
+	mask := [4]byte{0xDE, 0xAD, 0xBE, 0xEF}
+	for _, chunk := range []int{1, 3, 5, 7, 13, 1024} {
+		plain := make([]byte, 1000)
+		for i := range plain {
+			plain[i] = byte(i)
+		}
+		masked := append([]byte(nil), plain...)
+		for i := range masked {
+			masked[i] ^= mask[i&3]
+		}
+
+		buf := make([]byte, len(plain))
+		if err := readMaskedPayload(&chunkReader{data: masked, chunk: chunk}, buf, mask); err != nil {
+			t.Fatalf("chunk=%d: %v", chunk, err)
+		}
+		if !bytes.Equal(buf, plain) {
+			t.Fatalf("chunk=%d: unmasked mismatch", chunk)
+		}
+	}
+
+	// A short stream must report io.ErrUnexpectedEOF, not a successful read.
+	buf := make([]byte, 100)
+	short := make([]byte, 40)
+	if err := readMaskedPayload(&chunkReader{data: short, chunk: 7}, buf, mask); err != io.ErrUnexpectedEOF {
+		t.Fatalf("short read err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
 
 // buildFrame assembles a raw WebSocket frame with full control over every
 // header field so tests can construct frames the well-behaved testClient never

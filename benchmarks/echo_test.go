@@ -24,6 +24,8 @@ import (
 	"testing"
 
 	coder "github.com/coder/websocket"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 	gorilla "github.com/gorilla/websocket"
 	"github.com/ystepanoff/gowest"
 )
@@ -229,6 +231,32 @@ func coderServer() *httptest.Server {
 	}))
 }
 
+// gobwasServer echoes using gobwas/ws. gobwas is deliberately low-level: it has
+// no Conn type, so the handshake (ws.UpgradeHTTP, which hijacks the net/http
+// connection) and the read/echo/write loop are driven directly with the wsutil
+// helpers. wsutil.ReadClientData unmasks and returns the payload; the op code is
+// echoed back with wsutil.WriteServerMessage. Unlike the other servers gobwas
+// reads and writes straight on the net.Conn with no bufio layer, which is its
+// idiomatic usage.
+func gobwasServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _, err := ws.UpgradeHTTP(r, w)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			payload, op, err := wsutil.ReadClientData(conn)
+			if err != nil {
+				return
+			}
+			if err := wsutil.WriteServerMessage(conn, op, payload); err != nil {
+				return
+			}
+		}
+	}))
+}
+
 // --- benchmark ---------------------------------------------------------------
 
 func benchmarkEcho(b *testing.B, factory func() *httptest.Server, size int, opcode byte) {
@@ -280,6 +308,7 @@ func BenchmarkEcho(b *testing.B) {
 		{"gowest", gowestServer},
 		{"gorilla", gorillaServer},
 		{"coder", coderServer},
+		{"gobwas", gobwasServer},
 	}
 	sizes := []struct {
 		name   string
@@ -292,6 +321,7 @@ func BenchmarkEcho(b *testing.B) {
 		{"huge_bin_1MiB", 1 << 20, opBinary},
 		{"huge_bin_2MiB", 2 << 20, opBinary},
 		{"huge_bin_5MiB", 5 << 20, opBinary},
+		{"huge_bin_10MiB", 10 << 20, opBinary},
 	}
 	for _, lib := range libs {
 		for _, s := range sizes {

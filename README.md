@@ -32,32 +32,31 @@ A minimal, dependency-free WebSocket library for Go with a modern, context-first
 
 ## Performance
 
-On common, non-compressed workloads gowest matches or beats both
-`gorilla/websocket` and `coder/websocket`, while allocating an order of
-magnitude less per message. Numbers below are a one-message echo round trip over
-a TCP loopback connection, median of 6 runs on an Apple M4 Pro (Go 1.24); a
-single neutral client drives all three servers, so the only variable per row is
-the server library.
+On common, non-compressed workloads gowest matches or beats `gorilla/websocket`,
+`coder/websocket` and `gobwas/ws`, while allocating an order of magnitude less
+per message. Numbers below are a one-message echo round trip over a TCP loopback
+connection, median of 10 runs on an Apple M4 Pro (Go 1.24); a single neutral
+client drives every server, so the only variable per row is the server library.
 
-| Payload        | gowest        | gorilla          | coder            |
-| -------------- | ------------- | ---------------- | ---------------- |
-| 32 B text      | **15.93 µs**  | 16.06 µs         | 15.93 µs         |
-| 1 KiB binary   | **16.28 µs**  | 16.39 µs         | 17.01 µs         |
-| 64 KiB binary  | **38.83 µs**  | 69.92 µs (+80%)  | 68.49 µs (+76%)  |
-| 1 MiB binary   | **217.9 µs**  | 433.6 µs (+99%)  | 433.6 µs (+99%)  |
-| 5 MiB binary   | **951.7 µs**  | 1567.7 µs (+65%) | 1448.5 µs (+52%) |
+| Payload        | gowest       | gorilla          | coder            | gobwas           |
+| -------------- | ------------ | ---------------- | ---------------- | ---------------- |
+| 32 B text      | **15.84 µs** | 15.97 µs         | 15.85 µs         | 17.20 µs (+9%)   |
+| 1 KiB binary   | **15.96 µs** | 16.38 µs (+3%)   | 16.73 µs (+5%)   | 18.68 µs (+17%)  |
+| 64 KiB binary  | **39.09 µs** | 69.14 µs (+77%)  | 70.31 µs (+80%)  | 73.44 µs (+88%)  |
+| 1 MiB binary   | **211.3 µs** | 435.3 µs (+106%) | 445.0 µs (+111%) | 482.5 µs (+128%) |
+| 10 MiB binary  | **1.706 ms** | 2.950 ms (+73%)  | 3.187 ms (+87%)  | 3.125 ms (+83%)  |
 
-| Payload (allocs/op) | gowest | gorilla | coder |
-| ------------------- | ------ | ------- | ----- |
-| 32 B text           | **2**  | 3       | 2     |
-| 1 KiB binary        | **3**  | 6       | 5     |
-| 1 MiB binary        | **3**  | 34      | 31    |
-| 5 MiB binary        | **3**  | 42      | 39    |
+| Payload (allocs/op) | gowest | gorilla | coder | gobwas |
+| ------------------- | ------ | ------- | ----- | ------ |
+| 32 B text           | **2**  | 3       | 2     | 6      |
+| 1 KiB binary        | **3**  | 6       | 5     | 9      |
+| 1 MiB binary        | **3**  | 34      | 31    | 35     |
+| 10 MiB binary       | **3**  | 45      | 42    | 46     |
 
-Small messages are dominated by ~16 µs of loopback latency, so all three tie
-there; gowest's framing wins show from 64 KiB upward, and it holds a constant
-**3 allocations** (a single payload copy) at every size. `Read` costs one
-allocation, `Write` zero.
+Small messages are dominated by ~16 µs of loopback latency, so the field ties at
+32 B; gowest's framing wins show from 64 KiB upward (~2× faster), and it holds a
+constant **3 allocations** (a single payload copy) at every size. `Read` costs
+one allocation, `Write` zero.
 
 See [`BENCHMARKS.md`](BENCHMARKS.md) for the full methodology, all payload sizes
 and how to reproduce the numbers.
