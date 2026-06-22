@@ -93,6 +93,7 @@ var payloadSizes = []struct {
 	{"huge_bin_1MiB", 1 << 20, MessageBinary},
 	{"huge_bin_2MiB", 2 << 20, MessageBinary},
 	{"huge_bin_5MiB", 5 << 20, MessageBinary},
+	{"huge_bin_10MiB", 10 << 20, MessageBinary},
 }
 
 // BenchmarkReadFrame isolates the frame parser (header decode + unmask) from the
