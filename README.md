@@ -5,9 +5,9 @@
 [![CI](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml/badge.svg)](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ystepanoff/gowest.svg)](https://pkg.go.dev/github.com/ystepanoff/gowest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ystepanoff/gowest)](https://goreportcard.com/report/github.com/ystepanoff/gowest)
-<!-- Autobahn badge placeholder: published once the suite has been run and the
-     report is hosted (see autobahn/). -->
-![Autobahn](https://img.shields.io/badge/autobahn-pending-lightgrey)
+
+<!-- The CI badge above covers the Autobahn conformance suite, which runs as a
+     gating job in the same workflow (see the Conformance section). -->
 
 ![GoWest](GoWest.png)
 
@@ -219,14 +219,23 @@ overhead.
 gowest ships an [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
 harness in [`autobahn/`](autobahn/). Because gowest is server-only it runs in
 fuzzing-client mode (Autobahn connects to a gowest echo server and drives every
-RFC 6455 case). Run it locally with Docker:
+RFC 6455 case).
+
+**CI runs the full suite on every push** (the `autobahn` job in the workflow)
+and **fails the build if any case regresses** — `autobahn/check_report.py` parses
+the report and treats anything other than `OK` / `NON-STRICT` / `INFORMATIONAL` /
+`UNIMPLEMENTED` as a failure (`wstest` itself always exits 0, so this gate is what
+makes the result meaningful). The HTML/JSON report is uploaded as a build
+artifact on each run.
+
+Run the same suite locally with Docker:
 
 ```sh
 make autobahn          # builds the server, runs the suite, writes autobahn/report/
 ```
 
-The published Autobahn report and badge will be added here once the suite has
-been run end-to-end and the report hosted. See [`autobahn/README.md`](autobahn/README.md).
+See [`autobahn/README.md`](autobahn/README.md) for details and how to read the
+report.
 
 ## Production readiness
 
@@ -242,8 +251,9 @@ Honest status, so you can make an informed call:
 
 **What is not yet proven / missing**
 - **No production track record** — not yet known to run real traffic at scale.
-- **Autobahn results not yet published** — the harness exists; the run/report
-  are pending (see the badge above).
+- **Autobahn is run and gated in CI** but results have not yet been
+  independently verified or published outside CI; check the latest `autobahn`
+  job and its uploaded report for the current status.
 - **No client** (`Dial`) and **no compression** (permessage-deflate).
 - **No TLS helpers** — terminate `wss://` at your server/proxy.
 - Single maintainer; expect the occasional rough edge.

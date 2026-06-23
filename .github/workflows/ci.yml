@@ -47,3 +47,22 @@ jobs:
         run: |
           go vet ./...
           go test -run='^$' -bench='^$' ./...
+
+  autobahn:
+    name: autobahn conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Autobahn fuzzing client
+        working-directory: autobahn
+        run: docker compose up --build --abort-on-container-exit
+      - name: Check conformance report
+        working-directory: autobahn
+        run: python3 check_report.py
+      - name: Upload Autobahn report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: autobahn/report/
+          if-no-files-found: warn
