@@ -313,6 +313,12 @@ func TestParseClosePayload(t *testing.T) {
 			wantErrCD: StatusProtocolError,
 		},
 		{
+			name:      "reserved code 1004 rejected",
+			payload:   []byte{0x03, 0xEC}, // 1004 (reserved/undefined in RFC 6455)
+			wantErr:   true,
+			wantErrCD: StatusProtocolError,
+		},
+		{
 			name:      "reserved code 1005 rejected",
 			payload:   []byte{0x03, 0xED}, // 1005
 			wantErr:   true,
