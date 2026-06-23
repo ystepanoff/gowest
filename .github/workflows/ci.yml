@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The module declares go 1.19; test the floor and the latest stable.
+        go: ['1.19', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: go test -race
+        run: go test -race ./...
+
+  benchmarks:
+    name: benchmarks compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Compile in-package benchmarks
+        # -bench='^$' matches no benchmark, so nothing runs, but the test binary
+        # (including every Benchmark* function) is still compiled.
+        run: go test -run='^$' -bench='^$' ./...
+      - name: Vet and compile cross-library benchmarks
+        working-directory: benchmarks
+        run: |
+          go vet ./...
+          go test -run='^$' -bench='^$' ./...

@@ -1,0 +1,12 @@
+{
+  "outdir": "./report",
+  "servers": [
+    {
+      "agent": "gowest",
+      "url": "ws://server:9001"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {}
+}

@@ -1,0 +1,27 @@
+# Runs gowest against the Autobahn|Testsuite fuzzing client.
+#
+# `server` is the gowest echo server; `fuzzingclient` is the upstream Autobahn
+# image, which connects to it, runs every conformance case and writes an HTML
+# report to ./report. Run from this directory:
+#
+#   docker compose up --build --abort-on-container-exit
+#
+# then open report/index.html. See README.md in this directory for details.
+services:
+  server:
+    build:
+      # Build context is the repo root so the whole gowest module is available.
+      context: ..
+      dockerfile: autobahn/Dockerfile
+    expose:
+      - "9001"
+
+  fuzzingclient:
+    image: crossbario/autobahn-testsuite:0.8.2
+    depends_on:
+      - server
+    volumes:
+      - ./fuzzingclient.json:/config/fuzzingclient.json:ro
+      - ./report:/config/report
+    command: wstest -m fuzzingclient -s /config/fuzzingclient.json
+    working_dir: /config
