@@ -46,7 +46,7 @@ docker run -it --rm \
   -v "$PWD/autobahn/fuzzingclient.json:/config/fuzzingclient.json:ro" \
   -v "$PWD/autobahn/report:/config/report" \
   --network host \
-  crossbario/autobahn-testsuite:0.8.2 \
+  crossbario/autobahn-testsuite:25.10.1 \
   wstest -m fuzzingclient -s /config/fuzzingclient.json
 ```
 
