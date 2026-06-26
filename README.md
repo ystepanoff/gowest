@@ -3,11 +3,9 @@
 **A context-first, concurrency-safe, fast WebSocket library for Go.**
 
 [![CI](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml/badge.svg)](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml)
+[![Autobahn](https://github.com/ystepanoff/gowest/actions/workflows/autobahn.yml/badge.svg)](https://github.com/ystepanoff/gowest/actions/workflows/autobahn.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ystepanoff/gowest.svg)](https://pkg.go.dev/github.com/ystepanoff/gowest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ystepanoff/gowest)](https://goreportcard.com/report/github.com/ystepanoff/gowest)
-
-<!-- The CI badge above covers the Autobahn conformance suite, which runs as a
-     gating job in the same workflow (see the Conformance section). -->
 
 ![GoWest](GoWest.png)
 
@@ -221,7 +219,8 @@ harness in [`autobahn/`](autobahn/). Because gowest is server-only it runs in
 fuzzing-client mode (Autobahn connects to a gowest echo server and drives every
 RFC 6455 case).
 
-**CI runs the full suite on every push** (the `autobahn` job in the workflow)
+**CI runs the full suite on every push** (the dedicated
+[Autobahn workflow](.github/workflows/autobahn.yml), reflected in the badge above)
 and **fails the build if any case regresses** — `autobahn/check_report.py` parses
 the report and treats anything other than `OK` / `NON-STRICT` / `INFORMATIONAL` /
 `UNIMPLEMENTED` as a failure (`wstest` itself always exits 0, so this gate is what
