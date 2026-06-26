@@ -67,13 +67,15 @@ func (e *CloseError) Error() string {
 }
 
 // validProtocolCode reports whether code is a status code a peer is permitted
-// to send in a close frame, per RFC 6455 section 7.4.1. The reserved codes
-// 1005, 1006 and 1015 must never appear on the wire; codes in the registered
-// range 1000-1014 (excluding those) and the application range 3000-4999 are
-// accepted. The unregistered 1016-2999 range is rejected.
+// to send in a close frame, per RFC 6455 section 7.4.1. The reserved codes 1004,
+// 1005, 1006 and 1015 must never appear on the wire; the remaining registered
+// range 1000-1014 and the application range 3000-4999 are accepted. The
+// unregistered 1016-2999 range is rejected.
 func validProtocolCode(code StatusCode) bool {
 	switch code {
-	case StatusNoStatusReceived, StatusAbnormalClosure, StatusTLSHandshake:
+	// 1004 has no assigned meaning and, like 1005/1006/1015, is reserved and
+	// must not be sent (RFC 6455 section 7.4.1). It has no named constant.
+	case 1004, StatusNoStatusReceived, StatusAbnormalClosure, StatusTLSHandshake:
 		return false
 	}
 	switch {

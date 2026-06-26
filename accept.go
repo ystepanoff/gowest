@@ -82,7 +82,10 @@ func Accept(ctx context.Context, w http.ResponseWriter, r *http.Request, opts *A
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return nil, errors.New("gowest: handshake requires GET")
 	}
-	if !utils.TokenPresentInString(r.Header.Get("Upgrade"), "websocket") {
+	// RFC 6455 §4.2.1: the Upgrade token must be matched case-insensitively.
+	// Conformant clients send "websocket", but "WebSocket" is equally valid, so
+	// use the same case-insensitive token check as the Connection header below.
+	if !headerContainsToken(r.Header, "Upgrade", "websocket") {
 		http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
 		return nil, errors.New("gowest: missing or invalid Upgrade header")
 	}

@@ -15,3 +15,10 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# Generated Autobahn|Testsuite conformance report
+autobahn/report/
+
+# Python bytecode (e.g. from autobahn/check_report.py)
+__pycache__/
+*.pyc

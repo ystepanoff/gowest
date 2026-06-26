@@ -126,6 +126,40 @@ func (c *testClient) readFrame() (opcode byte, payload []byte, err error) {
 	return opcode, payload, err
 }
 
+// TestAcceptUpgradeHeaderCaseInsensitive guards RFC 6455 §4.2.1: the "Upgrade"
+// token must be matched case-insensitively. Conformant clients (and the Autobahn
+// suite) send "Upgrade: WebSocket"; a case-sensitive check rejects every such
+// handshake. The hand-rolled testClient sends lowercase, so this is exercised
+// directly against Accept with each casing.
+func TestAcceptUpgradeHeaderCaseInsensitive(t *testing.T) {
+	for _, upgrade := range []string{"websocket", "WebSocket", "WEBSOCKET"} {
+		t.Run(upgrade, func(t *testing.T) {
+			c1, c2 := net.Pipe()
+			t.Cleanup(func() { c1.Close(); c2.Close() })
+			go io.Copy(io.Discard, c2) // drain the 101 response and close frame
+
+			reqText := "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Upgrade: " + upgrade + "\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n\r\n"
+			req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(reqText)))
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			rec := &hijackRecorder{conn: c1, rw: bufio.NewReadWriter(
+				bufio.NewReader(c1), bufio.NewWriter(c1))}
+
+			conn, err := Accept(context.Background(), rec, req, &AcceptOptions{OriginPatterns: []string{"*"}})
+			if err != nil {
+				t.Fatalf("Accept rejected Upgrade: %q: %v", upgrade, err)
+			}
+			conn.Close(StatusNormalClosure, "")
+		})
+	}
+}
+
 func TestAcceptHandshake(t *testing.T) {
 	_, resp := dial(t, func(w http.ResponseWriter, r *http.Request) {
 		c, err := Accept(r.Context(), w, r, &AcceptOptions{OriginPatterns: []string{"*"}})
