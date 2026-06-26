@@ -50,10 +50,17 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	for {
 		typ, data, err := c.Read(ctx)
 		if err != nil {
-			// A *CloseError is the expected, clean end of a test case; anything
-			// else (protocol violation, I/O) is logged for triage.
-			var ce *gowest.CloseError
-			if !errors.As(err, &ce) {
+			// Most Autobahn cases end by either closing cleanly (*CloseError) or
+			// sending a deliberately malformed frame that gowest correctly
+			// rejects (*ProtocolError). Both are expected outcomes for a
+			// conformance run, so neither is logged; only a genuinely unexpected
+			// error (e.g. I/O) is surfaced, so a clean run stays quiet and real
+			// anomalies stand out.
+			var (
+				ce *gowest.CloseError
+				pe *gowest.ProtocolError
+			)
+			if !errors.As(err, &ce) && !errors.As(err, &pe) {
 				log.Printf("read: %v", err)
 			}
 			return
