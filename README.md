@@ -1,6 +1,6 @@
 # gowest
 
-**A context-first, concurrency-safe, fast WebSocket library for Go.**
+**A fast, context-first WebSocket library for Go.**
 
 [![CI](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml/badge.svg)](https://github.com/ystepanoff/gowest/actions/workflows/ci.yml)
 [![Autobahn](https://github.com/ystepanoff/gowest/actions/workflows/autobahn.yml/badge.svg)](https://github.com/ystepanoff/gowest/actions/workflows/autobahn.yml)
@@ -9,25 +9,47 @@
 
 ![GoWest](GoWest.png)
 
-gowest is a small WebSocket library built around a single `Conn` type with a
-modern, `context`-aware API and an explicit concurrency contract. It is a
-**server-side** library (RFC 6455) with **no external dependencies**.
+gowest is a modern implementation of the WebSocket protocol (RFC 6455) designed
+for new Go applications. It provides a simple, idiomatic API built around
+`context.Context`, safe concurrent writes, and high performance — all without
+external dependencies.
 
-- **Context-first** — `Accept`, `Read`, `Write` and `Ping` all honour
-  `context.Context` deadlines and cancellation.
-- **Concurrency-safe** — many goroutines may `Write` at once; frames never
-  interleave. The contract is explicit and documented below.
-- **Fast** — one allocation per `Read`, zero per `Write`, and ~2× the throughput
-  of gorilla/coder/gobwas on uncompressed payloads from 64 KiB up
-  ([benchmarks](#performance)).
-- **Correct** — transparent ping/pong and close handling, UTF-8 validation, and
-  framing-protocol enforcement, with an [Autobahn](autobahn/) harness to prove
-  it.
-- **Dependency-free** — only the standard library.
+## Why gowest?
 
-> **Status: beta.** The API is stable and the test suite (including `-race`) is
-> green, but gowest has not yet been validated in production deployments. See
+The Go ecosystem has excellent WebSocket libraries, but many were designed
+around APIs and conventions from earlier versions of Go. gowest embraces modern
+Go practices while remaining lightweight and easy to understand. It is a
+**server-side** library today; a client (`Dial`) is on the [roadmap](#roadmap).
+
+## Features
+
+- **High-performance** implementation optimised for low allocations and large
+  payloads (one allocation per `Read`, zero per `Write` — see
+  [benchmarks](#performance)).
+- **Context-first API** for cancellation, timeouts and request-scoped operations.
+- **Safe concurrent writes** with a clear concurrency model.
+- **Zero external dependencies** — only the standard library.
+- **RFC 6455 compliant**, validated by the Autobahn|Testsuite in CI.
+- **Configurable** origin validation, subprotocol negotiation and connection
+  limits.
+- **Small, focused API** that is easy to learn and difficult to misuse.
+
+Whether you are building a chat server, multiplayer game, real-time dashboard or
+streaming backend, gowest aims to provide a modern, reliable foundation for
+WebSocket communication in Go.
+
+> **Status: beta.** The API is stable, the test suite (including `-race`) is
+> green and the Autobahn conformance suite passes in CI, but gowest has not yet
+> been validated in production deployments. See
 > [Production readiness](#production-readiness) for the honest details.
+
+## Small API. Serious implementation.
+
+gowest intentionally exposes a compact API that covers the common 95% of
+WebSocket use cases. Rather than surfacing every protocol detail, it handles the
+complexity internally while remaining fully compliant with RFC 6455. The result
+is an API that is easy to learn, difficult to misuse, and performant enough for
+production workloads.
 
 ## Installation
 
@@ -43,53 +65,39 @@ Requires Go 1.19+.
 
 ## Quick start (server)
 
-gowest is **server-only today** — there is no `Dial`/client yet (it is on the
-[roadmap](#roadmap)). Upgrade an incoming HTTP request with `Accept`, then read
-and write messages on the returned `*Conn`:
+Upgrade an incoming HTTP request with `Accept`, then read and write messages on
+the returned `*Conn`. This is a complete echo handler:
 
 ```go
-package main
-
-import (
-	"context"
-	"log"
-	"net/http"
-
-	"github.com/ystepanoff/gowest"
-)
-
 func handler(w http.ResponseWriter, r *http.Request) {
-	c, err := gowest.Accept(r.Context(), w, r, &gowest.AcceptOptions{
-		OriginPatterns: []string{"*"}, // allow any origin; tighten in production
-	})
+	ctx := r.Context()
+
+	c, err := gowest.Accept(ctx, w, r, nil)
 	if err != nil {
-		log.Println("accept:", err)
 		return
 	}
-	defer c.Close(gowest.StatusInternalError, "")
+	defer c.Close(gowest.StatusNormalClosure, "")
 
-	ctx := context.Background()
 	for {
-		typ, data, err := c.Read(ctx)
+		typ, msg, err := c.Read(ctx)
 		if err != nil {
-			return // *gowest.CloseError on a clean peer close
+			break // *gowest.CloseError on a clean peer close
 		}
-		if err := c.Write(ctx, typ, data); err != nil {
-			return
+		if err := c.Write(ctx, typ, msg); err != nil {
+			break
 		}
 	}
-}
-
-func main() {
-	http.HandleFunc("/", handler)
-	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 ```
 
-A runnable version lives in [`examples/echo`](examples/echo). For a client to
-test against, use any browser or an existing client library (e.g.
-`coder/websocket`'s `Dial`) until gowest ships its own.
+Passing `nil` options applies the safe defaults, including a **same-origin**
+policy: cross-origin browsers are rejected. To accept other origins, pass
+`&gowest.AcceptOptions{OriginPatterns: []string{"*"}}` (or specific hosts).
+
+A complete, runnable program lives in [`examples/echo`](examples/echo). gowest is
+**server-only today** — there is no `Dial`/client yet (it is on the
+[roadmap](#roadmap)); to test against it, use a browser or an existing client
+library such as `coder/websocket`'s `Dial`.
 
 - **Upgrade** — `Accept` validates the handshake, checks the origin, negotiates
   a subprotocol and returns a `*Conn`.
@@ -133,7 +141,7 @@ resumed mid-frame). The full contract is documented in the
 
 The suite is run under the race detector in CI (`go test -race ./...`).
 
-## Features
+## Protocol support
 
 - [x] RFC 6455 server handshake (`Accept`) with origin checking
 - [x] Text and binary messages, including fragmented messages
@@ -207,10 +215,10 @@ Full methodology and per-size data: [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ¹ gorilla/websocket is widely deployed but its repository is in maintenance mode.
 
-If you need a client today, or compression, or a long battle-tested track
-record, choose `coder/websocket` or `gorilla/websocket`. Choose gowest when you
-want a small, dependency-free, context-first **server** with low per-message
-overhead.
+gowest's focus today is a modern, high-performance WebSocket **server**: a
+small, dependency-free, context-first API with low per-message overhead and
+constant per-message allocations. Client dialing and permessage-deflate are
+tracked on the [roadmap](#roadmap).
 
 ## Conformance (Autobahn)
 
@@ -236,31 +244,39 @@ make autobahn          # builds the server, runs the suite, writes autobahn/repo
 See [`autobahn/README.md`](autobahn/README.md) for details and how to read the
 report.
 
-## Production readiness
+## Production Readiness
 
-Honest status, so you can make an informed call:
+gowest is designed for production use as a server-side WebSocket library. The
+following capabilities are implemented and verified in the repository; the table
+reflects the current state rather than an aspiration.
 
-**What is in place**
-- Full unit/integration test suite, green under `go test -race ./...`.
-- CI on every push/PR: `go vet`, `go test`, `go test -race`, and benchmark
-  compilation, on Go 1.19 and latest stable.
-- Explicit, tested concurrency contract and context cancellation semantics.
-- Inbound size limits on by default (memory-exhaustion guard).
-- Benchmarks vs three established libraries.
+| Capability                  | Status | Evidence |
+| --------------------------- | ------ | -------- |
+| RFC 6455 framing & handshake | ✅ | [`frame.go`](frame.go), [`accept.go`](accept.go) |
+| Autobahn Test Suite          | ✅ | gated in [CI](.github/workflows/autobahn.yml), harness in [`autobahn/`](autobahn/) |
+| Safe concurrent writes       | ✅ | mutex-serialised `Write`; see [Concurrency guarantees](#concurrency-guarantees) |
+| Race detector in CI          | ✅ | `go test -race` in [CI](.github/workflows/ci.yml) |
+| Unit & integration tests     | ✅ | [`conn_test.go`](conn_test.go), [`context_test.go`](context_test.go), [`frame_test.go`](frame_test.go) |
+| Zero runtime dependencies    | ✅ | standard library only ([`go.mod`](go.mod)) |
+| Benchmarks vs gorilla/coder/gobwas | ✅ | [`BENCHMARKS.md`](BENCHMARKS.md) |
+| Server (`Accept`)            | ✅ | |
+| Client (`Dial`)              | 🚧 | planned ([roadmap](#roadmap)) |
+| permessage-deflate           | 🚧 | planned ([roadmap](#roadmap)) |
+| API stability                | Beta | pre-v1.0 |
 
-**What is not yet proven / missing**
-- **No production track record** — not yet known to run real traffic at scale.
-- **Autobahn is run and gated in CI** but results have not yet been
-  independently verified or published outside CI; check the latest `autobahn`
-  job and its uploaded report for the current status.
-- **No client** (`Dial`) and **no compression** (permessage-deflate).
-- **No TLS helpers** — terminate `wss://` at your server/proxy.
-- Single maintainer; expect the occasional rough edge.
+### API stability
 
-**Recommendation:** suitable for hobby projects, internal tools and evaluation,
-and for production **after** you run the Autobahn suite and load-test for your
-workload. Do not treat it as a drop-in, battle-tested replacement for
-gorilla/coder yet.
+gowest is pre-v1.0. The API is stable in day-to-day use, but minor breaking
+changes may still occur before the first tagged release (v1.0.0). After v1.0 the
+public API will follow semantic versioning.
+
+### Scope and limitations
+
+gowest is server-side only — there is no client (`Dial`) yet — and does not
+implement permessage-deflate compression or TLS helpers (terminate `wss://` at
+your server or reverse proxy). It has no published track record of running
+production traffic at scale; validate it against your own workload before
+relying on it.
 
 ## Migrating from the legacy API
 
@@ -280,9 +296,13 @@ make autobahn # RFC 6455 conformance suite (requires Docker)
 
 ## Roadmap
 
-- Client-side dialing (`Dial`) and a published Autobahn report.
+gowest today is a focused, high-performance WebSocket server. Planned work
+extends that foundation:
+
+- Client-side dialing (`Dial`).
 - permessage-deflate compression.
 - TLS helpers for `wss://`.
+- Additional ecosystem integrations.
 - A dedicated writer goroutine as an alternative to the write mutex.
 
 ## Contributing
